@@ -261,6 +261,12 @@ footer{text-align:center;font-size:11.5px;color:var(--ink-faint);margin-top:26px
     </div>
   </div>
 
+  <div class="panel" style="margin-bottom:16px;">
+    <h3><span class="sw" style="background:var(--dse)"></span>Cakupan Outlet per DSE</h3>
+    <div class="hint" id="hintCoverage">Perbandingan jumlah outlet yang sudah biometrik vs total outlet terdaftar per DSE (sumber: Mapping July)</div>
+    <canvas id="chartCoverage" style="max-height:320px;"></canvas>
+  </div>
+
   <div class="chart-grid2">
     <div class="panel">
       <h3><span class="sw" style="background:var(--outlet)"></span>Tren Harian Biometrik</h3>
@@ -344,6 +350,7 @@ const fmtRp = n => 'Rp ' + n.toLocaleString('id-ID');
 
 let branches, mcs, dses, outlets, outletNames, brands, rows;
 let mcToBranch, dseToMc, outletToDse;
+let totalOutletsByDse, totalOutletsByMc, totalOutletsByBranch, totalOutletsGrand, dseMeta;
 const state = { b:null, m:null, d:null, o:null, r:null };
 
 function cleanStr(v){ return String(v==null?'':v).replace(/^"|"$/g,'').trim(); }
@@ -404,6 +411,27 @@ async function loadLiveData(){
       joined.push({b,m,d,o:sc,oname,msisdn,cashback,brand,date});
     });
     if(!joined.length) throw new Error('Tidak ada baris valid setelah parsing. Cek nama kolom di sheet apakah masih sama.');
+
+    // ---- outlet universe totals from MAPPING JULY (ALL registered outlets, not just those with biometrik) ----
+    const seenOutlets = new Set();
+    totalOutletsByDse = new Map();
+    totalOutletsByMc = new Map();
+    totalOutletsByBranch = new Map();
+    dseMeta = new Map();
+    totalOutletsGrand = 0;
+    mapRows.forEach(r=>{
+      const oc = cleanId(r['outlet_code']);
+      const dse = cleanStr(r['cso_code']) || 'DSE-TIDAK TERPETAKAN';
+      const mc = cleanStr(r['micro_cluster_name']);
+      const br = cleanStr(r['Branch']);
+      if(!dseMeta.has(dse)) dseMeta.set(dse, {branch:br, mc:mc});
+      if(!oc || seenOutlets.has(oc)) return;
+      seenOutlets.add(oc);
+      totalOutletsGrand++;
+      totalOutletsByDse.set(dse, (totalOutletsByDse.get(dse)||0)+1);
+      if(mc) totalOutletsByMc.set(mc, (totalOutletsByMc.get(mc)||0)+1);
+      if(br) totalOutletsByBranch.set(br, (totalOutletsByBranch.get(br)||0)+1);
+    });
 
     branches = [...branchSet].sort();
     mcs = [...mcSet].sort();
@@ -532,6 +560,13 @@ function resetAll(){
   refresh();
 }
 
+function currentTotalOutlets(){
+  if(state.d!==null) return totalOutletsByDse.get(dses[state.d]) ?? null;
+  if(state.m!==null) return totalOutletsByMc.get(mcs[state.m]) ?? null;
+  if(state.b!==null) return totalOutletsByBranch.get(branches[state.b]) ?? null;
+  return totalOutletsGrand;
+}
+
 // ---------- KPI ----------
 function renderKPI(){
   const fr = filteredRows();
@@ -539,11 +574,15 @@ function renderKPI(){
   const outletSet = new Set(fr.map(r=>r[R_O]));
   const dseSet = new Set(fr.map(r=>r[R_D]));
   const cashTotal = fr.reduce((a,r)=>a+r[R_C],0);
+  const totalOutletsCtx = currentTotalOutlets();
+  const outletSub = (totalOutletsCtx!=null)
+    ? 'Dari '+fmt(totalOutletsCtx)+' outlet terdaftar ('+(totalOutletsCtx? (outletSet.size/totalOutletsCtx*100).toFixed(1):'0')+'%)'
+    : 'Dari '+fmt(outlets.length)+' outlet total';
   const cards = [
     {cls:'k1', lbl:'Jumlah Biometrik', val: fmt(fr.length), sub:'Total baris registrasi msisdn'},
     {cls:'k2', lbl:'Pelanggan Unik', val: fmt(uniqSet.size), sub:'Distinct msisdn'},
-    {cls:'k3', lbl:'Outlet Aktif', val: fmt(outletSet.size), sub:'Dari '+fmt(outlets.length)+' outlet total'},
-    {cls:'k4', lbl:'DSE Aktif', val: fmt(dseSet.size), sub:'Dari '+fmt(dses.length)+' DSE total'},
+    {cls:'k3', lbl:'Outlet Aktif', val: fmt(outletSet.size), sub: outletSub},
+    {cls:'k4', lbl:'DSE Aktif', val: fmt(dseSet.size), sub:'Dari '+fmt(dses.length)+' DSE bertransaksi'},
     {cls:'k5', lbl:'Total Cashback', val: fmtRp(cashTotal), sub:'Akumulasi nilai cashback'},
   ];
   document.getElementById('kpiRow').innerHTML = cards.map(c=>`
@@ -555,7 +594,7 @@ function renderKPI(){
 }
 
 // ---------- charts ----------
-let chBranch, chMC, chDSE, chTrend, chBrand;
+let chBranch, chMC, chDSE, chCoverage, chTrend, chBrand;
 const palette = getComputedStyle(document.documentElement);
 const cBranch = palette.getPropertyValue('--branch').trim();
 const cMC = palette.getPropertyValue('--mc').trim();
@@ -637,6 +676,62 @@ function renderDSEChart(){
       if(!wasSel){ state.m = dseToMc.get(idx); state.b = mcToBranch.get(state.m); }
       refresh();
     })
+  });
+}
+
+function renderDSECoverageChart(){
+  // active (already did biometrik) outlet count per DSE, respecting current branch/mc/brand filter
+  const activeByDse = new Map();
+  filteredRows({skipD:true}).forEach(r=>{
+    const dseName = dses[r[R_D]];
+    if(!activeByDse.has(dseName)) activeByDse.set(dseName, new Set());
+    activeByDse.get(dseName).add(r[R_O]);
+  });
+
+  // candidate DSEs = those belonging to current branch/mc filter, from the FULL outlet universe (mapping),
+  // so DSEs with zero biometrik yet still show up (that's the point of a coverage view)
+  let candidates = [...totalOutletsByDse.keys()].filter(dse=>{
+    const meta = dseMeta.get(dse);
+    if(!meta) return false;
+    if(state.b!==null && meta.branch!==branches[state.b]) return false;
+    if(state.m!==null && meta.mc!==mcs[state.m]) return false;
+    return true;
+  });
+  candidates.sort((a,b)=> totalOutletsByDse.get(b)-totalOutletsByDse.get(a));
+  candidates = candidates.slice(0,15);
+
+  document.getElementById('hintCoverage').textContent = candidates.length
+    ? 'Top 15 DSE berdasarkan jumlah outlet terdaftar (mengikuti filter Branch/MC aktif)'
+    : 'Tidak ada DSE pada cakupan filter ini';
+
+  const labels = candidates.map(d=> d==='DSE-TIDAK TERPETAKAN' ? '⚠ Tdk termapping' : d);
+  const totalData = candidates.map(d=> totalOutletsByDse.get(d)||0);
+  const activeData = candidates.map(d=> activeByDse.has(d) ? activeByDse.get(d).size : 0);
+
+  if(chCoverage) chCoverage.destroy();
+  chCoverage = new Chart(document.getElementById('chartCoverage'), {
+    type:'bar',
+    data:{
+      labels,
+      datasets:[
+        {label:'Total Outlet Terdaftar', data:totalData, backgroundColor: hexA(cDSE,0.22), borderRadius:5, barThickness:9},
+        {label:'Outlet Sudah Biometrik', data:activeData, backgroundColor: cDSE, borderRadius:5, barThickness:9},
+      ]
+    },
+    options:{
+      indexAxis:'y',
+      responsive:true,
+      maintainAspectRatio:false,
+      plugins:{
+        legend:{position:'top', align:'end', labels:{boxWidth:10, font:{size:11}}},
+        tooltip:{callbacks:{label:(ctx)=>{
+          const t = totalData[ctx.dataIndex];
+          const pct = (ctx.datasetIndex===1 && t) ? ' ('+(activeData[ctx.dataIndex]/t*100).toFixed(0)+'% dari total)' : '';
+          return ' '+ctx.dataset.label+': '+fmt(ctx.parsed.x)+pct;
+        }}}
+      },
+      scales:{ x:{grid:{color:'#EEEFF7'}, ticks:{font:{size:10.5}}}, y:{grid:{display:false}, ticks:{font:{size:11}}} }
+    }
   });
 }
 
@@ -793,6 +888,7 @@ function refresh(){
   renderBranchChart();
   renderMCChart();
   renderDSEChart();
+  renderDSECoverageChart();
   renderTrendChart();
   renderBrandChart();
   renderTable();
