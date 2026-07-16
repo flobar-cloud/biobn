@@ -354,8 +354,25 @@ let totalOutletsByDse, totalOutletsByMc, totalOutletsByBranch, totalOutletsGrand
 const state = { b:null, m:null, d:null, o:null, r:null };
 
 function cleanStr(v){ return String(v==null?'':v).replace(/^"|"$/g,'').trim(); }
-function cleanId(v){ return cleanStr(v).replace(/,/g,'').replace(/\.0$/,''); }
+function cleanId(v){ return cleanStr(v).replace(/[.,\s]/g,'').replace(/\.0$/,''); }
 function cleanNum(v){ const s = cleanStr(v).replace(/[^0-9.-]/g,''); const n = parseFloat(s); return isNaN(n)?0:n; }
+// Currency/whole-number fields (cashback, date) never have decimals here, so just strip
+// every non-digit character (this also safely handles "Rp10.000", "10,000", "10.000", etc.)
+function cleanInt(v){ const s = cleanStr(v).replace(/[^0-9]/g,''); return s? parseInt(s,10) : 0; }
+
+function buildHeaderMap(fields){
+  const map = {};
+  (fields||[]).forEach(f=>{ map[String(f).trim().toLowerCase().replace(/\s+/g,'_')] = f; });
+  return map;
+}
+// robust field getter: tries each candidate name (case/space/underscore-insensitive)
+function pick(row, headerMap, ...candidates){
+  for(const c of candidates){
+    const key = headerMap[c.toLowerCase().replace(/\s+/g,'_')];
+    if(key!==undefined && row[key]!==undefined && row[key]!==null && row[key]!=='') return row[key];
+  }
+  return '';
+}
 
 function fetchCsv(sheetName){
   return fetch(csvUrl(sheetName)).then(res=>{
@@ -366,7 +383,7 @@ function fetchCsv(sheetName){
       throw new Error('Sheet "'+sheetName+'" tidak bisa diakses publik (dapat halaman login, bukan CSV). Pastikan sharing sudah "Anyone with the link - Viewer".');
     }
     const parsed = Papa.parse(text, { header:true, skipEmptyLines:true });
-    return parsed.data;
+    return { rows: parsed.data, headerMap: buildHeaderMap(parsed.meta.fields) };
   });
 }
 
@@ -377,32 +394,34 @@ async function loadLiveData(){
   document.getElementById('statusDot').style.background = '#E0511A';
   document.getElementById('statusText').textContent = 'Memuat data...';
   try{
-    const [tagRows, mapRows] = await Promise.all([
+    const [tagCsv, mapCsv] = await Promise.all([
       fetchCsv(SHEET_TAG_N_GO),
       fetchCsv(SHEET_MAPPING)
     ]);
+    const tagRows = tagCsv.rows, tH = tagCsv.headerMap;
+    const mapRows = mapCsv.rows, mH = mapCsv.headerMap;
     if(!tagRows.length) throw new Error('Sheet "Tag n GO" kosong atau kolomnya tidak terbaca.');
     if(!mapRows.length) throw new Error('Sheet "MAPPING JULY" kosong atau kolomnya tidak terbaca.');
 
     // outlet_code -> {cso_code, outlet_name}
     const mapByOutlet = new Map();
     mapRows.forEach(r=>{
-      const oc = cleanId(r['outlet_code']);
+      const oc = cleanId(pick(r, mH, 'outlet_code'));
       if(oc && !mapByOutlet.has(oc)){
-        mapByOutlet.set(oc, { cso: cleanStr(r['cso_code']) || 'DSE-TIDAK TERPETAKAN', name: cleanStr(r['outlet_name']) || 'Outlet Tidak Terpetakan' });
+        mapByOutlet.set(oc, { cso: cleanStr(pick(r, mH, 'cso_code')) || 'DSE-TIDAK TERPETAKAN', name: cleanStr(pick(r, mH, 'outlet_name')) || 'Outlet Tidak Terpetakan' });
       }
     });
 
     const branchSet=new Set(), mcSet=new Set(), dseSet=new Set(), outletSet=new Set(), brandSet=new Set();
     const joined = [];
     tagRows.forEach(r=>{
-      const b = cleanStr(r['sales_area_name']);
-      const m = cleanStr(r['micro_cluster_name']);
-      const sc = cleanId(r['short_code']);
-      const msisdn = cleanId(r['msisdn']);
-      const cashback = cleanNum(r['cashback_value']);
-      const brand = cleanStr(r['brand']);
-      const date = cleanNum(r['data_date']);
+      const b = cleanStr(pick(r, tH, 'sales_area_name'));
+      const m = cleanStr(pick(r, tH, 'micro_cluster_name'));
+      const sc = cleanId(pick(r, tH, 'short_code'));
+      const msisdn = cleanId(pick(r, tH, 'msisdn'));
+      const cashback = cleanInt(pick(r, tH, 'cashback_value', 'cashback_amount', 'cashback', 'nilai_cashback'));
+      const brand = cleanStr(pick(r, tH, 'brand'));
+      const date = cleanInt(pick(r, tH, 'data_date', 'tanggal', 'date'));
       if(!b || !m || !sc || !msisdn) return; // skip malformed rows
       const map = mapByOutlet.get(sc);
       const d = map ? map.cso : 'DSE-TIDAK TERPETAKAN';
@@ -420,10 +439,10 @@ async function loadLiveData(){
     dseMeta = new Map();
     totalOutletsGrand = 0;
     mapRows.forEach(r=>{
-      const oc = cleanId(r['outlet_code']);
-      const dse = cleanStr(r['cso_code']) || 'DSE-TIDAK TERPETAKAN';
-      const mc = cleanStr(r['micro_cluster_name']);
-      const br = cleanStr(r['Branch']);
+      const oc = cleanId(pick(r, mH, 'outlet_code'));
+      const dse = cleanStr(pick(r, mH, 'cso_code')) || 'DSE-TIDAK TERPETAKAN';
+      const mc = cleanStr(pick(r, mH, 'micro_cluster_name'));
+      const br = cleanStr(pick(r, mH, 'branch'));
       if(!dseMeta.has(dse)) dseMeta.set(dse, {branch:br, mc:mc});
       if(!oc || seenOutlets.has(oc)) return;
       seenOutlets.add(oc);
